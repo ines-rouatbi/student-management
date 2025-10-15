@@ -1,0 +1,128 @@
+pipeline {
+    agent any
+
+    environment {
+        SONARQUBE_SERVER = 'SonarQube'                       // Name configured in Jenkins > Manage Jenkins > Configure System
+        NEXUS_URL = 'http://localhost:8081/repository/docker-hosted/'
+        NEXUS_CREDENTIALS_ID = 'nexus-credentials'           // Jenkins credentials ID for Nexus
+        KUBECONFIG_CREDENTIALS_ID = 'kubeconfig-credentials' // Jenkins credentials ID for kubeconfig file
+        APP_VERSION = '1.0.0'
+    }
+
+    stages {
+
+        // ===============================
+        // Stage 1 : Checkout Code
+        // ===============================
+        stage('Checkout') {
+            steps {
+                echo '🔹 Checking out source code from Git...'
+                checkout scm
+            }
+        }
+
+        // ===============================
+        // Stage 2 : SonarQube Analysis
+        // ===============================
+        stage('SonarQube Analysis') {
+            steps {
+                echo '🔹 Running SonarQube code analysis...'
+                withSonarQubeEnv("${SONARQUBE_SERVER}") {
+                    sh '''
+                        mvn clean verify sonar:sonar \
+                            -Dsonar.projectKey=${APP_NAME} \
+                            -Dsonar.projectName="${APP_NAME}" \
+                            -Dsonar.projectVersion=${APP_VERSION} \
+                            -Dsonar.sources=src \
+                            -Dsonar.java.binaries=target/classes
+                    '''
+                }
+            }
+        }
+
+        // ===============================
+        // Stage 3 : SonarQube Quality Gate
+        // ===============================
+        stage('SonarQube Quality Gate') {
+            steps {
+                echo '🔍 Waiting for SonarQube Quality Gate result...'
+                timeout(time: 3, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
+                }
+            }
+        }
+
+        // ===============================
+        // Stage 4 : Build Artifact
+        // ===============================
+        stage('Build') {
+            steps {
+                echo '🔹 Building Maven project...'
+                sh 'mvn clean package -DskipTests'
+            }
+        }
+
+        // ===============================
+        // Stage 5 : Push Artifact to Nexus
+        // ===============================
+        stage('Push to Nexus') {
+            steps {
+                echo '📦 Uploading artifact to Nexus Repository...'
+                withCredentials([usernamePassword(credentialsId: "${NEXUS_CREDENTIALS_ID}", usernameVariable: 'NEXUS_USER', passwordVariable: 'NEXUS_PASS')]) {
+                    sh '''
+                        mvn deploy:deploy-file \
+                            -Durl=${NEXUS_URL} \
+                            -DrepositoryId=nexus \
+                            -Dfile=target/${APP_NAME}.jar \
+                            -DgroupId=com.example \
+                            -DartifactId=${APP_NAME} \
+                            -Dversion=${APP_VERSION} \
+                            -Dpackaging=jar \
+                            -DgeneratePom=true \
+                            -Dusername=$NEXUS_USER \
+                            -Dpassword=$NEXUS_PASS
+                    '''
+                }
+            }
+        }
+
+        // ===============================
+        // Stage 6 : Deploy to Kubernetes
+        // ===============================
+       stage('Deploy to Kubernetes') {
+            steps {
+                echo "⚙️ Deploying to Kubernetes..."
+                sh """
+                    kubectl set image deployment/springboot-deployment springboot=$DOCKER_REGISTRY/$IMAGE_NAME:$IMAGE_TAG --record
+                """
+            }
+        }
+        
+        // ===============================
+        // Stage 7 : Monitoring Check
+        // ===============================
+        stage('Monitoring') {
+            steps {
+                echo '📊 Checking monitoring endpoints...'
+                sh '''
+                    echo "🔗 Prometheus: ${PROMETHEUS_URL}"
+                    echo "🔗 Grafana: ${GRAFANA_URL}"
+                    echo "✅ Checking Prometheus target availability..."
+                    curl -s ${PROMETHEUS_URL}/api/v1/targets | grep "up" || echo "⚠️ Prometheus target not responding"
+                '''
+            }
+        }
+    }
+
+    // ===============================
+    // Post Pipeline Notifications
+    // ===============================
+    post {
+        success {
+            echo '✅ Pipeline executed successfully! Application deployed and monitored.'
+        }
+        failure {
+            echo '❌ Pipeline failed. Please check Jenkins logs for errors.'
+        }
+    }
+}
